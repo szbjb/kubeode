@@ -1,0 +1,13 @@
+{
+  "registry-mirrors": [
+    "https://registry.k8s.io",
+    "https://registry-1.docker.io",
+    "https://ghcr.io",
+    "https://quay.io",
+    "https://dockerproxy.net",
+    "https://k8s.gcr.io"
+  ],
+  "insecure-registries": [
+    "kubeode.registry.local:6000"
+  ]
+}

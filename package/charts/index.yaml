@@ -1,0 +1,199 @@
+apiVersion: v1
+entries:
+  csi-driver-nfs:
+  - apiVersion: v1
+    appVersion: v4.9.0
+    created: "2024-12-22T23:14:00.427956567+08:00"
+    description: CSI NFS Driver for Kubernetes
+    digest: 045f8c0995a657d2dcd7aa36fc16fd18315e23e68fc8cc4b328dcdc2e37a0c9a
+    name: csi-driver-nfs
+    urls:
+    - csi-driver-nfs-v4.9.0.tgz
+    version: v4.9.0
+  longhorn:
+  - apiVersion: v1
+    appVersion: v1.7.2
+    created: "2024-12-22T23:14:00.431137954+08:00"
+    description: Longhorn is a distributed block storage system for Kubernetes.
+    digest: 863c011cdc37dd0ad95595ed52b5ac43ef1394fa6012e607397f86e6b682be6a
+    home: https://github.com/longhorn/longhorn
+    icon: https://raw.githubusercontent.com/cncf/artwork/master/projects/longhorn/icon/color/longhorn-icon-color.png
+    keywords:
+    - longhorn
+    - storage
+    - distributed
+    - block
+    - device
+    - iscsi
+    - nfs
+    kubeVersion: '>=1.21.0-0'
+    maintainers:
+    - email: maintainers@longhorn.io
+      name: Longhorn maintainers
+    name: longhorn
+    sources:
+    - https://github.com/longhorn/longhorn
+    - https://github.com/longhorn/longhorn-engine
+    - https://github.com/longhorn/longhorn-instance-manager
+    - https://github.com/longhorn/longhorn-share-manager
+    - https://github.com/longhorn/longhorn-manager
+    - https://github.com/longhorn/longhorn-ui
+    - https://github.com/longhorn/longhorn-tests
+    - https://github.com/longhorn/backing-image-manager
+    urls:
+    - longhorn-1.7.2.tgz
+    version: 1.7.2
+  metrics-server:
+  - annotations:
+      category: Analytics
+      images: |
+        - name: metrics-server
+          image: docker.io/bitnami/metrics-server:0.7.2-debian-12-r8
+      licenses: Apache-2.0
+    apiVersion: v2
+    appVersion: 0.7.2
+    created: "2024-12-22T23:14:00.433652644+08:00"
+    dependencies:
+    - name: common
+      repository: oci://registry-1.docker.io/bitnamicharts
+      tags:
+      - bitnami-common
+      version: 2.x.x
+    description: Metrics Server aggregates resource usage data, such as container
+      CPU and memory usage, in a Kubernetes cluster and makes it available via the
+      Metrics API.
+    digest: 7ea522e889302ce8d1e7e2f6960f9b28d6425e392603f6735a98db9cfd541682
+    home: https://bitnami.com
+    icon: https://bitnami.com/assets/stacks/metrics-server/img/metrics-server-stack-220x234.png
+    keywords:
+    - metrics-server
+    - cluster
+    - metrics
+    maintainers:
+    - name: Broadcom, Inc. All Rights Reserved.
+      url: https://github.com/bitnami/charts
+    name: metrics-server
+    sources:
+    - https://github.com/bitnami/charts/tree/main/bitnami/metrics-server
+    urls:
+    - metrics-server-7.3.0.tgz
+    version: 7.3.0
+  nginx-ingress-controller:
+  - annotations:
+      category: Infrastructure
+      images: |
+        - name: nginx
+          image: docker.io/bitnami/nginx:1.27.3-debian-12-r0
+        - name: nginx-ingress-controller
+          image: docker.io/bitnami/nginx-ingress-controller:1.11.3-debian-12-r6
+      licenses: Apache-2.0
+    apiVersion: v2
+    appVersion: 1.11.3
+    created: "2024-12-22T23:14:00.437340683+08:00"
+    dependencies:
+    - name: common
+      repository: oci://registry-1.docker.io/bitnamicharts
+      tags:
+      - bitnami-common
+      version: 2.x.x
+    description: NGINX Ingress Controller is an Ingress controller that manages external
+      access to HTTP services in a Kubernetes cluster using NGINX.
+    digest: 6eca2eeffa21f075723fcded4f5eff88d630635b02ef779d365f4e682988ddb9
+    home: https://bitnami.com
+    icon: https://bitnami.com/assets/stacks/nginx-ingress-controller/img/nginx-ingress-controller-stack-220x234.png
+    keywords:
+    - ingress
+    - nginx
+    - http
+    - web
+    - www
+    - reverse proxy
+    kubeVersion: '>= 1.20.0-0'
+    maintainers:
+    - name: Broadcom, Inc. All Rights Reserved.
+      url: https://github.com/bitnami/charts
+    name: nginx-ingress-controller
+    sources:
+    - https://github.com/bitnami/charts/tree/main/bitnami/nginx-ingress-controller
+    urls:
+    - nginx-ingress-controller-11.6.0.tgz
+    version: 11.6.0
+  openebs:
+  - apiVersion: v2
+    appVersion: 3.10.0
+    created: "2024-12-22T23:14:00.47134513+08:00"
+    dependencies:
+    - condition: openebs-ndm.enabled
+      name: openebs-ndm
+      repository: https://openebs.github.io/node-disk-manager
+      version: 2.1.0
+    - condition: localpv-provisioner.enabled
+      name: localpv-provisioner
+      repository: https://openebs.github.io/dynamic-localpv-provisioner
+      version: 3.5.0
+    - condition: cstor.enabled
+      name: cstor
+      repository: https://openebs.github.io/cstor-operators
+      version: 3.6.0
+    - condition: jiva.enabled
+      name: jiva
+      repository: https://openebs.github.io/jiva-operator
+      version: 3.6.0
+    - condition: zfs-localpv.enabled
+      name: zfs-localpv
+      repository: https://openebs.github.io/zfs-localpv
+      version: 2.4.0
+    - condition: lvm-localpv.enabled
+      name: lvm-localpv
+      repository: https://openebs.github.io/lvm-localpv
+      version: 1.4.0
+    - condition: nfs-provisioner.enabled
+      name: nfs-provisioner
+      repository: https://openebs.github.io/dynamic-nfs-provisioner
+      version: 0.11.0
+    - condition: mayastor.enabled
+      name: mayastor
+      repository: https://openebs.github.io/mayastor-extensions
+      version: 2.5.0
+    description: Containerized Attached Storage for Kubernetes
+    digest: 0139e8a13fb95b14f23f49cf437c3027f749b7e1e0d451f66e041c92ea45586c
+    home: http://www.openebs.io/
+    icon: https://raw.githubusercontent.com/cncf/artwork/HEAD/projects/openebs/icon/color/openebs-icon-color.png
+    keywords:
+    - cloud-native-storage
+    - block-storage
+    - local-storage
+    - iSCSI
+    - NVMe
+    - storage
+    - kubernetes
+    maintainers:
+    - email: kiran.mova@mayadata.io
+      name: kmova
+    - email: prateek.pandey@mayadata.io
+      name: prateekpandey14
+    - email: shovan.maity@mayadata.io
+      name: shovanmaity
+    name: openebs
+    sources:
+    - https://github.com/openebs/openebs
+    urls:
+    - openebs-3.10.0.tgz
+    version: 3.10.0
+  tigera-operator:
+  - apiVersion: v2
+    appVersion: v3.29.1
+    created: "2024-12-22T23:14:00.47798121+08:00"
+    description: Installs the Tigera operator for Calico
+    digest: a7b4ff016bebe0cab58d321acc2f4fe11683058aee03c13558ee41febb1c9da5
+    home: https://docs.tigera.io/calico
+    icon: https://docs.tigera.io/img/calico-logo.png
+    name: tigera-operator
+    sources:
+    - https://github.com/projectcalico/calico/tree/master/charts/tigera-operator
+    - https://github.com/tigera/operator
+    - https://github.com/projectcalico/calico
+    urls:
+    - tigera-operator-v3.29.1.tgz
+    version: v3.29.1
+generated: "2024-12-22T23:14:00.423036041+08:00"

@@ -1,0 +1,409 @@
+- name: 清理环境
+  block:
+    - name: 删除 Kubernetes 配置和证书
+      become: yes
+      shell: |
+        cd /etc/kubernetes/
+        rm -rfv admin.conf controller-manager.conf kubelet.conf pki/* scheduler.conf super-admin.conf /var/lib/etcd /var/lib/kubelet
+        cd /etc/kubernetes/manifests/
+        rm -rfv etcd.yaml kube-apiserver.yaml kube-controller-manager.yaml kube-scheduler.yaml
+      ignore_errors: yes
+      args:
+        executable: /bin/bash
+      register: cleanup_output
+
+    - name: 打印清理命令输出
+      ansible.builtin.debug:
+        var: cleanup_output.stdout
+
+    - name: 重启 kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+
+    - name: 重启 Docker 服务
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: 检查是否有 Docker 容器
+      shell: docker ps -qa
+      register: docker_container_ids
+
+    - name: 停止并删除所有 Docker 容器
+      shell: echo "{{ docker_container_ids.stdout }}" | xargs -r docker rm -f
+      when: docker_container_ids.stdout != ""
+      ignore_errors: yes
+
+    - name: 检查是否有残留的 Docker 容器
+      shell: docker ps -a
+      register: docker_ps_output
+
+    - name: 打印 Docker 容器检查结果
+      ansible.builtin.debug:
+        var: docker_ps_output.stdout
+
+    - name: 如果有残留容器则终止执行
+      fail:
+        msg: "存在残留的 Docker 容器，终止执行。"
+      when: docker_ps_output.stdout != "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES"
+
+    - name: 运行 kubeode-registry 容器
+      shell: |
+        docker run -d \
+          --name kubeode-registry \
+          --network bridge \
+          -p 443:443 \
+          -p 6000:6000 \
+          -v /usr/local/kubeode/package/offline/Images/data_registry:/var/lib/registry \
+          --dns 8.8.8.8 \
+          --dns 114.114.114.114 \
+          --memory 512m \
+          --memory-reservation 256m \
+          --cpus 0.5 \
+          --security-opt no-new-privileges \
+          --restart unless-stopped \
+          ghcr.io/szbjb/kubeode_registry:latest
+      args:
+        executable: /bin/bash
+
+# 私有仓库api接口检查
+- name: 检查私有仓库 API 接口健康状态
+  block:
+    - name: 定义要检查的 URL 列表
+      set_fact:
+        urls:
+          - "https://registry-1.docker.io:443"
+          - "https://ghcr.io:443"
+          - "https://quay.io:443"
+          - "https://k8s.gcr.io:443"
+          - "https://registry.k8s.io:443"
+
+    - name: 检查每个 URL 的健康状态
+      block:
+        - name: 检查 URL 健康状态
+          shell: |
+            for i in {1..30}; do
+              if curl -k -s "{{ item }}" > /dev/null; then
+                echo "{{ item }} 是健康的！"
+                exit 0
+              else
+                echo "{{ item }} 不可用，尝试第 $i 次..."
+                sleep 2
+              fi
+            done
+            echo "{{ item }} 在 30 次尝试后仍不可用，标记为不健康。"
+            exit 1
+          register: health_check
+          loop: "{{ urls }}"
+          ignore_errors: yes
+
+    - name: 输出健康检查结果
+      ansible.builtin.debug:
+        msg: "{{ item }} 的健康状态: {{ health_check.results[idx].stdout }}"
+      loop: "{{ urls }}"
+      loop_control:
+        index_var: idx
+
+    - name: 打印每个 URL 的返回码
+      ansible.builtin.debug:
+        msg: "{{ item.item }} 的返回码: {{ item.rc }}"
+      loop: "{{ health_check.results }}"
+
+    - name: 检查是否所有接口正常
+      shell: |
+        for result in {{ health_check.results | to_json }}; do
+          if [ $(echo $result | jq -r '.rc') -ne 0 ]; then
+            echo "有接口��正常，请检查！"
+            exit 1
+          fi
+        done
+        echo "所有接口正常。"
+      register: check_results
+      failed_when: check_results.rc != 0
+
+- name: 配置 kubelet Cgroup 控制组
+  ansible.builtin.copy:
+    dest: /etc/sysconfig/kubelet
+    content: |
+      KUBELET_EXTRA_ARGS="--cgroup-driver=systemd"
+    mode: '0644'
+    force: yes
+
+- name: 停止并启用 kubelet 服务
+  ansible.builtin.systemd:
+    name: kubelet.service
+    enabled: yes
+    state: restarted
+
+- name: 获取网络接口名称
+  shell: nmcli device status | awk '/ connected|已连接/ {print $1}' | head -n 1
+  register: network_interface
+
+- name: 获取vip地址
+  shell: egrep HAClusterVIP  /etc/ansible/hosts|awk   '{print  $NF}'
+  register: vip
+
+- name: 创建 /etc/kubernetes/manifests 目录
+  ansible.builtin.file:
+    path: /etc/kubernetes/manifests
+    state: directory
+    mode: '0755'
+
+- name: 生成 kube-vip 配置
+  shell: |
+    docker run --network host --rm ghcr.io/kube-vip/kube-vip:{{ kv_version }} manifest pod \
+      --interface {{ network_interface.stdout }} \
+      --address {{ vip.stdout }} \
+      --controlplane \
+      --services \
+      --arp \
+      --leaderElection | sed 's/path: \/etc\/kubernetes\/admin.conf/path: \/etc\/kubernetes\/super-admin.conf/g' > /etc/kubernetes/manifests/kube-vip.yaml
+
+- name: 生成 kubeadm 配置文件
+  shell: kubeadm config print init-defaults --component-configs KubeletConfiguration > /root/kubeadm.yaml
+
+- name: 修改 kubeadm 配置文件
+  block:
+    - name: 获取本机 IP
+      shell: ip -o -4 addr show up | awk '{print $2, $4}' | grep -v 'docker0' | grep -v 'lo' | head -n 1 | awk '{print $2}' | cut -d/ -f1
+      register: local_ip
+
+    - name: 修改 advertiseAddress
+      ansible.builtin.lineinfile:
+        path: /root/kubeadm.yaml
+        regexp: '^  advertiseAddress:.*'
+        line: "  advertiseAddress: {{ local_ip.stdout }}"
+        state: present
+
+    - name: 修改默认运行时为 docker
+      ansible.builtin.replace:
+        path: /root/kubeadm.yaml
+        regexp: 'containerd/containerd.sock'
+        replace: 'cri-dockerd.sock'
+
+    - name: 指定集群 VIP 地址
+      ansible.builtin.lineinfile:
+        path: /root/kubeadm.yaml
+        insertafter: '^controllerManager:'
+        line: 'controlPlaneEndpoint: "{{ vip.stdout }}:6443"'
+        state: present
+
+    - name: 获取 PodCIDR
+      shell: "egrep PodCIDR /etc/ansible/hosts | awk '{print $NF}'"
+      register: pod_cidr
+
+    - name: 获取 ServiceCIDR
+      shell: "egrep ServiceCIDR /etc/ansible/hosts | awk '{print $NF}'"
+      register: service_cidr
+
+    - name: 计算 clusterDNS
+      set_fact:
+        cluster_dns: "{{ service_cidr.stdout.split('.')[0:3] | join('.') }}.10"
+
+    - name: 修改 pod 网络
+      ansible.builtin.lineinfile:
+        path: /root/kubeadm.yaml
+        insertafter: 'serviceSubnet:'
+        line: "  podSubnet: {{ pod_cidr.stdout }}"
+        state: present
+
+    - name: 修改 svc 网络和 DNS
+      ansible.builtin.replace:
+        path: /root/kubeadm.yaml
+        regexp: '10.96.0.0/12'
+        replace: "{{ service_cidr.stdout }}"
+      notify:
+        - Update DNS
+
+    - name: 替换 clusterDNS IP 地址
+      replace:
+        path: /root/kubeadm.yaml
+        regexp: '10.96.0.10'
+        replace: "{{ cluster_dns }}"
+
+    - name: 修改 kube-proxy 模式为 ipvs
+      ansible.builtin.blockinfile:
+        path: /root/kubeadm.yaml
+        block: |
+          ---
+          apiVersion: kubeproxy.config.k8s.io/v1alpha1
+          kind: KubeProxyConfiguration
+          mode: ipvs
+        state: present
+
+    - name: 处理证书时长
+      ansible.builtin.replace:
+        path: /root/kubeadm.yaml
+        regexp: '87600h0m0s|8760h0m0s'
+        replace: '876000h0m0s'
+
+
+
+
+- name: 拉取相关镜像
+  shell: kubeadm config images pull --config /root/kubeadm.yaml
+  register: kubeadm_images_pull_output
+
+- name: 打印拉取镜像命令输出
+  ansible.builtin.debug:
+    var: kubeadm_images_pull_output
+
+- name: 删除 registry-static-pod.yaml 文件（如果存在）
+  shell: |
+    test -f /etc/kubernetes/manifests/registry-static-pod.yaml && rm -fv /etc/kubernetes/manifests/registry-static-pod.yaml
+  args:
+    executable: /bin/bash
+
+
+- name: 初始化集群
+  shell: kubeadm init --config /root/kubeadm.yaml --v=5
+  register: kubeadm_init_output
+
+- name: 打印初始化集群命令输出
+  ansible.builtin.debug:
+    var: kubeadm_init_output
+
+- name: 配置 kube 环境变量
+  block:
+    - name: 创建 .kube 目录
+      ansible.builtin.file:
+        path: "~/.kube"
+        state: directory
+
+    - name: 复制 admin.conf
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "~/.kube/config"
+        owner: "root"
+        group: "root"
+        mode: '0644'
+        force: yes
+
+- name: 恢复 kube-vip 配置
+  ansible.builtin.replace:
+    path: /etc/kubernetes/manifests/kube-vip.yaml
+    regexp: 'super-admin.conf'
+    replace: 'admin.conf'
+
+- name: 重启 kubelet
+  ansible.builtin.systemd:
+    name: kubelet
+    state: restarted
+
+- name: 等待 VIP 接口就绪
+  shell: |
+    while true; do
+      sleep 1
+      echo "等待 VIP 接口就绪"
+      curl -k https://{{ vip.stdout }}:6443/version && break
+    done
+
+- name: 设置 Helm 版本
+  set_fact:
+    helm_version: "v3.16.3"
+
+- name: 设置 Helm 版本和下载 URL
+  block:
+    - name: 设置 Helm 版本和下载 URL
+      set_fact:
+        online_download_url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        local_download_url: "http://kubeode.down.local:10086/offline/tools/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        download_type: "online"
+
+    - name: 下载 Helm 二进制文件
+      shell: |
+        if [ "{{ download_type }}" = "online" ]; then
+            wget {{ online_download_url }} -O /tmp/helm.tar.gz
+        else
+            wget {{ local_download_url }} -O /tmp/helm.tar.gz
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: 解压 Helm 二进制文件到 /usr/bin
+      shell: tar xvf /tmp/helm.tar.gz --strip-components=1 -C /usr/bin/ linux-amd64/helm
+      args:
+        executable: /bin/bash
+
+- name: 部署网络插件
+  block:
+    - name: 设置 Calico 版本和下载 URL
+      set_fact:
+        calico_version: "v3.29.1"
+        online_repo_url: "https://projectcalico.docs.tigera.io/charts"
+        local_repo_url: "http://kubeode.down.local:10086/charts/"  
+        #cd /usr/local/kubeode/package/charts/ 
+        # 更新仓库 helm repo index . --url http://kubeode.down.local:10086/charts/
+        download_type: "online"  # 可以设置为 "local" 使用局域网源
+
+    - name: 添加 Calico Helm 仓库
+      shell: |
+        if [ "{{ download_type }}" = "online" ]; then
+            helm repo add projectcalico {{ online_repo_url }}
+        else
+            helm repo add projectcalico {{ local_repo_url }}
+        fi
+        helm repo update
+
+    - name: 等待 VIP 接口就绪
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        while true; do
+          sleep 1
+          echo "等待 VIP 接口就绪"
+          curl -k https://{{ vip.stdout }}:6443/version && break
+        done
+
+    - name: 安装 Calico 网络插件
+      shell: |
+        PodCIDR=$(egrep PodCIDR /etc/ansible/hosts | awk '{print $NF}')
+        helm install calico projectcalico/tigera-operator \
+          --namespace kube-system \
+          --set installation.calicoNetwork.ipPools[0].cidr=${PodCIDR} \
+          --set installation.calicoNetwork.ipPools[0].natOutgoing=Enabled \
+          --set installation.calicoNetwork.ipPools[0].encapsulation=IPIP \
+          --set installation.calicoNetwork.bgp=Enabled
+
+    - name: 配置 kubectl 自动补全
+      shell: |
+        grep completion /root/.bash_profile || echo 'source <(kubectl completion bash)' >> /root/.bash_profile
+        source /root/.bash_profile
+      args:
+        executable: /bin/bash
+
+    - name: 配置 Helm 自动补全
+      shell: |
+        grep helm /etc/profile || echo 'source <(helm completion bash)' >> /etc/profile
+      args:
+        executable: /bin/bash
+
+    - name: 设置 kube 配置权限
+      file:
+        path: /root/.kube/config
+        mode: '0720'
+
+
+- name: 检查所有 Pod 状态
+  shell: kubectl get pods -A -o wide
+
+- name: 等待所有 Pod 进入 Running 状态
+  shell: |
+    while true; do
+      sleep 5
+      echo "检查所有 Pod 状态..."
+      if kubectl get pods -A --no-headers | grep -v Running | grep -v Completed | wc -l | grep -q '^0$'; then
+        echo "所有 Pod 已经进入 Running 状态。"
+        break
+      fi
+    done
+
+- name: 删除临时私有仓库
+  shell: docker rm -f kubeode-registry
+
+
+- name: 复制 registry-static-pod.yaml 文件
+  shell: \cp -av /usr/local/kubeode/playbooks/roles/registry_setup/templates/registry-static-pod.yaml /etc/kubernetes/manifests/
+  args:
+    executable: /bin/bash
+

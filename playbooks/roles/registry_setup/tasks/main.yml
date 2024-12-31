@@ -1,0 +1,130 @@
+# 检查 data_registry.tar 文件是否存在
+- name: 检查 data_registry.tar 文件是否存在
+  stat:
+    path: /usr/local/kubeode/package/offline/Images/data_registry.tar
+  register: data_registry_tar
+
+# 仅当文件存在时才解压
+- name: 解压 data_registry.tar 到目标目录
+  unarchive:
+    src: /usr/local/kubeode/package/offline/Images/data_registry.tar
+    dest: /usr/local/kubeode/package/offline/Images/
+    remote_src: yes
+  when: data_registry_tar.stat.exists
+  register: unarchive_result
+
+# 打印解压日志
+- name: 打印解压日志
+  debug:
+    var: unarchive_result
+  when: data_registry_tar.stat.exists
+
+
+- name: 创建静态 Pod 目录
+  file:
+    path: /etc/kubernetes/manifests
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+    
+
+- name: 创建静态 Pod 配置文件
+  copy:
+    dest: /etc/kubernetes/manifests/registry-static-pod.yaml
+    content: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: kubeode-registry  # 修改此处
+        namespace: kube-system
+      spec:
+        tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        dnsPolicy: ClusterFirst
+        dnsConfig:
+          nameservers:
+            - 8.8.8.8
+            - 114.114.114.114
+        containers:
+        - name: kubeode-registry  # 修改此处
+          image: ghcr.io/szbjb/kubeode_registry:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - name: data-registry-k8s-io
+            mountPath: /var/lib/registry
+          ports:
+          - containerPort: 443
+            hostPort: 443
+          - containerPort: 6000
+            hostPort: 6000
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+        volumes:
+        - name: data-registry-k8s-io
+          hostPath:
+            path: /usr/local/kubeode/package/offline/Images/data_registry
+            type: DirectoryOrCreate
+
+- name: 确保 kubelet 服务正在运行
+  service:
+    name: kubelet
+    state: started
+    enabled: yes
+
+- name: 检查是否有 Docker 容器
+  shell: |
+    docker ps -qa
+  register: docker_containers
+
+- block:
+    - name: 删除所有现有的 Docker 容器
+      shell: |
+        docker rm -f $(docker ps -qa)
+      args:
+        executable: /bin/bash
+      when: docker_containers.stdout != ""
+
+  rescue:
+    - name: 显示警告而不是失败
+      debug:
+        msg: "没有容器需要删除，跳过此步骤。"
+      when: docker_containers.stdout == ""
+
+- name: 运行 kubeode-registry 容器
+  shell: |
+    docker run -d \
+      --name kubeode-registry \
+      --network bridge \
+      -p 443:443 \
+      -p 6000:6000 \
+      -v /usr/local/kubeode/package/offline/Images/data_registry:/var/lib/registry \
+      --dns 8.8.8.8 \
+      --dns 114.114.114.114 \
+      --memory 512m \
+      --memory-reservation 256m \
+      --cpus 0.5 \
+      --security-opt no-new-privileges \
+      --restart unless-stopped \
+      ghcr.io/szbjb/kubeode_registry:latest
+  args:
+    executable: /bin/bash
+
+- name: 打印当前运行的 Docker 容器
+  shell: |
+    docker ps
+  register: docker_ps_result
+
+- name: 显示 Docker 容器列表
+  debug:
+    var: docker_ps_result.stdout
+

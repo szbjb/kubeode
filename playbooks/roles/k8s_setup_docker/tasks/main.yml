@@ -1,0 +1,350 @@
+- name: 检查 etcd 离线包是否存在
+  stat:
+    path: /usr/local/kubeode/package/offline/tools/etcd-v3.5.17-linux-amd64.tar.gz
+  register: etcd_tar
+
+- name: 检查离线源连接是否可用
+  ansible.builtin.uri:
+    url: "http://kubeode.down.local:10086/offline/tools/"
+    method: GET
+    return_content: no
+    timeout: 5
+  register: offline_url_status
+  ignore_errors: yes
+  retries: 3
+  delay: 2
+
+- name: 调试离线源状态
+  debug:
+    msg: "离线源状态: {{ offline_url_status.status }}"
+
+- name: 调试离线源状态类型
+  debug:
+    msg: "离线源状态类型: {{ offline_url_status.status | type_debug }}"
+
+- name: 设置下载类型
+  set_fact:
+    install_method: "{{ 'offline' if offline_url_status.status == 200 else 'online' }}"
+
+- name: 确认安装方式
+  debug:
+    msg: "安装方式: {{ install_method }}"
+
+- name: 删除旧的 Docker 二进制文件
+  ansible.builtin.file:
+    path: "/tmp/docker-{{ docker_version }}.tgz"
+    state: absent
+
+- name: 设置 Docker 版本和下载 URL
+  set_fact:
+    docker_version: "27.3.1"
+    online_download_url: "https://download.docker.com/linux/static/stable/x86_64/docker-{{ docker_version }}.tgz"
+    local_download_url: "http://kubeode.down.local:10086/offline/tools/docker-{{ docker_version }}.tgz"
+
+- name: 下载 Docker 二进制文件（在线）
+  ansible.builtin.get_url:
+    url: "{{ online_download_url }}"
+    dest: "/tmp/docker-{{ docker_version }}.tgz"
+    timeout: 30
+  when: install_method == "online"
+
+- name: 下载 Docker 二进制文件（离线）
+  ansible.builtin.get_url:
+    url: "{{ local_download_url }}"
+    dest: "/tmp/docker-{{ docker_version }}.tgz"
+    timeout: 30
+  when: install_method == "offline"
+
+- name: 解压 Docker 二进制文件
+  ansible.builtin.unarchive:
+    src: "/tmp/docker-{{ docker_version }}.tgz"
+    dest: "/usr/bin/"
+    remote_src: yes
+    extra_opts: ['--strip-components=1']
+
+- name: 创建 containerd.service 文件
+  ansible.builtin.copy:
+    dest: /lib/systemd/system/containerd.service
+    content: |
+      [Unit]
+      Description=containerd container runtime
+      Documentation=https://containerd.io
+      After=network.target local-fs.target
+
+      [Service]
+      ExecStartPre=-/sbin/modprobe overlay
+      ExecStart=/usr/bin/containerd
+
+      Type=notify
+      Delegate=yes
+      KillMode=process
+      Restart=always
+      RestartSec=5
+      LimitNPROC=infinity
+      LimitCORE=infinity
+      LimitNOFILE=infinity
+      TasksMax=infinity
+      OOMScoreAdjust=-999
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+    force: yes  # 强制覆盖文件
+
+- name: 从 /etc/ansible/hosts 获取 Docker 存储路径
+  ansible.builtin.set_fact:
+    docker_storage_path: "{{ lookup('pipe', \"egrep image_storage_path /etc/ansible/hosts | awk '{print $NF}'\") }}"
+
+- name: 创建 docker.service 文件
+  ansible.builtin.copy:
+    dest: /lib/systemd/system/docker.service
+    content: |
+      [Unit]
+      Description=Docker Application Container Engine
+      Documentation=https://docs.docker.com
+      After=network-online.target docker.socket firewalld.service containerd.service time-set.target
+      Wants=network-online.target containerd.service
+      Requires=docker.socket
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock --data-root={{ docker_storage_path }}
+      ExecReload=/bin/kill -s HUP $MAINPID
+      TimeoutStartSec=0
+      RestartSec=2
+      Restart=always
+      StartLimitBurst=3
+      StartLimitInterval=60s
+      LimitNPROC=infinity
+      LimitCORE=infinity
+      TasksMax=infinity
+      Delegate=yes
+      KillMode=process
+      OOMScoreAdjust=-500
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+    force: yes  # 强制覆盖文件
+
+- name: 创建 docker.socket 文件
+  ansible.builtin.copy:
+    dest: /lib/systemd/system/docker.socket
+    content: |
+      [Unit]
+      Description=Docker Socket for the API
+
+      [Socket]
+      ListenStream=/run/docker.sock
+      SocketMode=0660
+      SocketUser=root
+      SocketGroup=docker
+
+      [Install]
+      WantedBy=sockets.target
+    mode: '0644'
+    force: yes  # 强制覆盖文件
+
+- name: 配置 Docker Cgroup
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+
+- name: 创建 Docker daemon.json
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"]
+      }
+    mode: '0644'
+    force: yes  # 强制覆盖文件
+
+- name: 创建 Docker 组
+  ansible.builtin.group:
+    name: docker
+    state: present
+
+- name: 重新加载 systemd
+  ansible.builtin.systemd:
+    daemon_reload: yes
+
+- name: 停止 Docker 服务
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - containerd.service
+    - docker.socket
+    - docker.service
+
+- name: 启用并启动 Docker 服务
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: yes
+    state: restarted  # 确保服务被重启
+  loop:
+    - containerd.service
+    - docker.socket
+    - docker.service
+  register: result
+  until: result is succeeded
+  retries: 5
+  delay: 10
+
+- name: 删除旧的 cri-dockerd 文件
+  ansible.builtin.file:
+    path: "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+    state: absent
+
+- name: 下载 cri-dockerd
+  shell: |
+    if [ "{{ install_method }}" = "online" ]; then
+        wget https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz -O /tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
+    else
+        wget http://kubeode.down.local:10086/offline/tools/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz -O /tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
+    fi
+  args:
+    executable: /bin/bash
+  register: download_cri_dockerd_result
+  until: download_cri_dockerd_result is succeeded
+  retries: 3
+  delay: 5
+
+- name: 解压 cri-dockerd
+  ansible.builtin.unarchive:
+    src: "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+    dest: "/usr/bin/"
+    remote_src: yes
+    extra_opts: ['--strip-components=1']
+
+- name: 创建 cri-docker.service 文件
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/cri-docker.service
+    content: |
+      [Unit]
+      Description=CRI Interface for Docker Application Container Engine
+      Documentation=https://docs.mirantis.com
+      After=network-online.target firewalld.service docker.service
+      Wants=network-online.target
+      Requires=cri-docker.socket
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/bin/cri-dockerd --pod-infra-container-image=registry.k8s.io/pause:3.10 --container-runtime-endpoint=unix:///var/run/cri-dockerd.sock --cri-dockerd-root-directory=/var/lib/dockershim --cri-dockerd-root-directory=/var/lib/docker
+      ExecReload=/bin/kill -s HUP $MAINPID
+      TimeoutSec=0
+      RestartSec=2
+      Restart=always
+      StartLimitBurst=3
+      StartLimitInterval=60s
+      LimitNOFILE=infinity
+      LimitNPROC=infinity
+      LimitCORE=infinity
+      TasksMax=infinity
+      Delegate=yes
+      KillMode=process
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+    force: yes  # 强制覆盖文件
+
+- name: 创建 cri-docker.socket 文件
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/cri-docker.socket
+    content: |
+      [Unit]
+      Description=CRI Docker Socket for the API
+      PartOf=cri-docker.service
+
+      [Socket]
+      ListenStream=/var/run/cri-dockerd.sock
+      SocketMode=0660
+      SocketUser=root
+      SocketGroup=docker
+
+      [Install]
+      WantedBy=sockets.target
+    mode: '0644'
+    force: yes  # 强制覆盖文件
+
+- name: 重新加载 systemd
+  ansible.builtin.systemd:
+    daemon_reload: yes
+
+- name: 停止 cri-docker 服务
+  ansible.builtin.systemd:
+    name: cri-docker.service
+    state: stopped
+
+- name: 启用并启动 cri-docker 服务
+  ansible.builtin.systemd:
+    name: cri-docker.service
+    enabled: yes
+    state: restarted  # 确保服务被重启
+
+- name: 安装 Kubernetes 工具
+  block:
+    - name: 使用在线源安装 Kubernetes 工具
+      when: install_method == "online"
+      block:
+        - name: 安装 Kubernetes 组件
+          shell: |
+            if [[ "{{ ansible_distribution_major_version }}" =~ ^(8|9|20|24)$ ]]; then
+              dnf install -y kubelet kubeadm kubectl
+            else
+              yum install -y kubelet kubeadm kubectl --enablerepo=kubeode_base,kubeode_extras,kubeode_updates,kubeode_epel,kubeode_kubernetes --disablerepo='*'
+            fi
+          args:
+            executable: /bin/bash
+
+    - name: 使用离线源安装 Kubernetes 工具
+      when: install_method == "offline"
+      shell: |
+        yum install -y kubelet kubeadm kubectl --disablerepo='*' --enablerepo=kubeode_local
+      args:
+        executable: /bin/bash
+
+- name: 复制 certs.d 文件夹到 /etc/docker/
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/roles/k8s_setup_docker/templates/certs.d/"
+    dest: "/etc/docker/certs.d/"
+    remote_src: no  # 确保从控制节点复制到远程节点
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: 复制 daemon.json 到 /etc/docker/
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/roles/k8s_setup_docker/templates/daemon.json"
+    dest: "/etc/docker/daemon.json"
+    remote_src: no  # 确保从控制节点复制到远程节点
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: 重新加载 systemd
+  ansible.builtin.systemd:
+    daemon_reload: yes
+
+- name: 重启 Docker 服务
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    
+
+- name: 检查 kubeode_registry.tar.gz 是否存在
+  stat:
+    path: /usr/local/kubeode/package/offline/Images/kubeode_registry.tar.gz
+  register: registry_caddy_tar
+  delegate_to: localhost  # 强制在控制节点执行
+
+- name: 导入 Docker 镜像
+  shell: |
+    tar -xvf /usr/local/kubeode/package/offline/Images/kubeode_registry.tar.gz -C /usr/local/kubeode/package/offline/Images/
+    docker load -i /usr/local/kubeode/package/offline/Images/kubeode_registry.tar
+  when: registry_caddy_tar.stat.exists
+  args:
+    executable: /bin/bash
+  delegate_to: localhost  # 强制在控制节点执行

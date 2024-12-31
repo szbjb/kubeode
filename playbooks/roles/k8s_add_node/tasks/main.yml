@@ -1,0 +1,59 @@
+- name: 打印 add_worker_nodes 的值
+  debug:
+    var: add_worker_nodes
+
+- name: 设置本机IP为全局变量
+  set_fact:
+    global_local_ip: "{{ local_ip }}"  # 使用传递的 local_ip 变量
+
+- name: 获取 vip 地址
+  shell: egrep HAClusterVIP /etc/ansible/hosts | awk '{print $NF}'
+  register: vip
+  delegate_to: "{{ global_local_ip }}"
+
+- name: 清理节点现有的 Kubernetes 配置
+  shell: |
+    kubeadm reset -f
+    rm -rf /etc/kubernetes/
+    rm -rf /var/lib/kubelet/*
+    rm -rf /var/lib/etcd
+    docker rm -f $(docker ps -qa)
+    systemctl restart kubelet
+  delegate_to: "{{ item }}"
+  with_items: "{{ add_worker_nodes.split(',') }}"
+
+- name: 生成 kubeadm token 和 sha256
+  shell: |
+    token=$(kubeadm token create)
+    sha256=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | sha256sum | awk '{print "sha256:" $1}')
+    echo "$token"
+    echo "$sha256"
+  register: kubeadm_output
+  delegate_to: "{{ global_local_ip }}"
+
+- name: 设置 cri-socket
+  set_fact:
+    cri_socket: "{% if runtime == 'docker' %}unix:///var/run/cri-dockerd.sock{% elif runtime == 'containerd' %}unix:///run/containerd/containerd.sock{% elif runtime == 'crio' %}unix:///var/run/crio/crio.sock{% else %}unix:///var/run/cri-dockerd.sock{% endif %}"
+
+- name: 调试输出 cri_socket 的值
+  debug:
+    msg: "cri_socket='{{ cri_socket }}'"
+
+- name: 生成 kubeadm join 命令
+  shell: kubeadm token create --print-join-command
+  register: join_command
+  delegate_to: "{{ global_local_ip }}"
+
+
+- name: 重启 kubelet 并设置开机自启
+  shell: |
+    systemctl restart kubelet
+    systemctl enable kubelet
+  delegate_to: "{{ item }}"
+  with_items: "{{ add_worker_nodes.split(',') }}"
+
+- name: 执行 kubeadm join
+  shell: "{{ join_command.stdout }} --cri-socket={{ cri_socket }}"
+  delegate_to: "{{ item }}"
+  with_items: "{{ add_worker_nodes.split(',') }}"
+  when: inventory_hostname == item

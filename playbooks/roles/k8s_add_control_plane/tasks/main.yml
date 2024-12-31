@@ -1,0 +1,199 @@
+- name: 打印 add_control_plane_nodes 的值
+  debug:
+    var: add_control_plane_nodes
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 清理节点现有的 Kubernetes 配置
+  shell: |
+    kubeadm reset -f
+    rm -rf /etc/kubernetes/
+    rm -rf /var/lib/kubelet/*
+    rm -rf /var/lib/etcd
+    docker rm -f $(docker ps -qa)
+    systemctl restart kubelet
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 设置 cri-socket
+  set_fact:
+    cri_socket: >-
+      {% if runtime == 'docker' %}
+        unix:///var/run/cri-dockerd.sock
+      {% elif runtime == 'containerd' %}
+        unix:///run/containerd/containerd.sock
+      {% elif runtime == 'crio' %}
+        unix:///var/run/crio/crio.sock
+      {% else %}
+        unix:///var/run/cri-dockerd.sock
+      {% endif %}
+  run_once: true
+
+- name: 获取 vip 地址
+  shell: egrep HAClusterVIP /etc/ansible/hosts | awk '{print $NF}'
+  register: vip_output
+  delegate_to: "{{ local_ip }}"
+  run_once: true
+
+- name: 设置全局变量 vip_address
+  set_fact:
+    vip_address: "{{ vip_output.stdout }}"
+  run_once: true
+
+- name: 生成 kubeadm token 和 sha256
+  shell: |
+    token=$(kubeadm token create)
+    sha256=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | sha256sum | awk '{print "sha256:" $1}')
+    echo "$token"
+    echo "$sha256"
+  register: kubeadm_output
+  delegate_to: "{{ local_ip }}"
+  run_once: true
+
+- name: 设置全局变量 token 和 sha256
+  set_fact:
+    kubeadm_token: "{{ kubeadm_output.stdout_lines[0] }}"
+    kubeadm_sha256: "{{ kubeadm_output.stdout_lines[1] }}"
+  run_once: true
+
+- name: 打印生成的 kubeadm token 和 sha256
+  debug:
+    msg: "生成的 token: {{ kubeadm_token }}, sha256: {{ kubeadm_sha256 }}"
+  run_once: true
+
+- name: 打印 local_ip 的值
+  debug:
+    msg: "当前 local_ip 的值是: {{ local_ip }}"
+
+- name: 创建 /etc/kubernetes/pki 目录
+  file:
+    path: /etc/kubernetes/pki
+    state: directory
+    mode: '0755'
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 创建 /etc/kubernetes/manifests 目录
+  file:
+    path: /etc/kubernetes/manifests
+    state: directory
+    mode: '0755'
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 创建 /etc/kubernetes/pki/etcd 目录
+  file:
+    path: /etc/kubernetes/pki/etcd
+    state: directory
+    mode: '0755'
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 拷贝 CA 证书和密
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: no
+  loop:
+    - { src: '/etc/kubernetes/pki/ca.crt', dest: '/etc/kubernetes/pki/ca.crt' }
+    - { src: '/etc/kubernetes/pki/ca.key', dest: '/etc/kubernetes/pki/ca.key' }
+    - { src: '/etc/kubernetes/pki/front-proxy-ca.crt', dest: '/etc/kubernetes/pki/front-proxy-ca.crt' }
+    - { src: '/etc/kubernetes/pki/front-proxy-ca.key', dest: '/etc/kubernetes/pki/front-proxy-ca.key' }
+    - { src: '/etc/kubernetes/pki/etcd/ca.crt', dest: '/etc/kubernetes/pki/etcd/ca.crt' }
+    - { src: '/etc/kubernetes/pki/etcd/ca.key', dest: '/etc/kubernetes/pki/etcd/ca.key' }
+    - { src: '/etc/kubernetes/pki/sa.key', dest: '/etc/kubernetes/pki/sa.key' }
+    - { src: '/etc/kubernetes/pki/sa.pub', dest: '/etc/kubernetes/pki/sa.pub' }
+    - { src: '/etc/kubernetes/admin.conf', dest: '/etc/kubernetes/admin.conf' }
+    - { src: '/etc/kubernetes/manifests/kube-vip.yaml', dest: '/etc/kubernetes/manifests/kube-vip.yaml' }
+  delegate_to: "{{ inventory_hostname }}"
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 获取网络接口名称
+  shell: nmcli device status | awk '/ connected|已连接/ {print $1}' | head -n 1
+  register: network_interface
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 调试输出网络接口名称
+  debug:
+    var: network_interface
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 读取 kube-vip.yaml 中的网卡名
+  slurp:
+    src: /etc/kubernetes/manifests/kube-vip.yaml
+  register: kube_vip_yaml
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 提取 kube-vip.yaml 中的 vip_interface
+  set_fact:
+    expected_network_interface: "{{ kube_vip_yaml.content | b64decode | from_yaml | json_query('spec.containers[0].env[?name==`vip_interface`].value') | first }}"
+  when:
+    - kube_vip_yaml is defined
+    - "'content' in kube_vip_yaml"
+    - inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 调试输出当前网卡名和期望网卡名
+  debug:
+    msg: "当前网卡名: {{ network_interface.stdout | default('未定义') }}, 期望网卡名: {{ expected_network_interface | default('未定义') }}"
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 修改 kube-vip.yaml 中的网卡名（如果不一致）
+  replace:
+    path: /etc/kubernetes/manifests/kube-vip.yaml
+    regexp: '(^\s*- name: vip_interface\s+value: ).*'
+    replace: '\1{{ network_interface.stdout }}'
+  when:
+    - network_interface.stdout is defined
+    - network_interface.stdout != expected_network_interface
+
+- name: 确保新增机器的网卡名与配置文件一致
+  debug:
+    msg: "警告: 新增机器的网卡名与配置文件不一致，当前网卡名为 {{ network_interface.stdout | default('未定义') }}，期望网卡名为 {{ expected_network_interface | default('未定义') }}。"
+  when:
+    - network_interface.stdout is defined
+    - network_interface.stdout != expected_network_interface
+
+- name: 打印修改后的 kube-vip.yaml 内容
+  command: cat /etc/kubernetes/manifests/kube-vip.yaml
+  register: modified_kube_vip_yaml
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 调试输出修改后的 kube-vip.yaml 内容
+  debug:
+    var: modified_kube_vip_yaml.stdout
+  when: modified_kube_vip_yaml is defined and inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 重启 Kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 设置 Kubelet 开机自启
+  systemd:
+    name: kubelet
+    enabled: yes
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+
+- name: 执行 kubeadm join
+  shell: |
+    kubeadm join {{ vip_address }}:6443 \
+    --token {{ kubeadm_token }} \
+    --discovery-token-ca-cert-hash {{ kubeadm_sha256 }} \
+    --control-plane \
+    --cri-socket={{ cri_socket | trim }}  # 使用 trim 过滤器去除空格
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 创建 /root/.kube 目录
+  file:
+    path: /root/.kube
+    state: directory
+    mode: '0700'
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+- name: 拷贝 admin.conf 到 /root/.kube/config
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    mode: '0644'
+  when: inventory_hostname in add_control_plane_nodes.split(',')
+
+
+
+  
