@@ -1,4 +1,3 @@
-![输入图片说明](package/kubeode.jpg)
 
 # 
 
