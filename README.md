@@ -92,7 +92,6 @@ README.MD 首页产品指导书已于2023/4/22 输出新版如本页面
 往期指导请访问：[往期README.MD](https://gitee.com/q7104475/kubeode/blob/master/Software_package/readme_copy.md)
 
 # k8s一键部署项目，专注更快部署k8s，欢迎star
-[![zhuang kang/K8s](https://gitee.com/q7104475/K8s/widgets/widget_card.svg?colors=037efa,ffffff,ffffff,e3e9ed,666666,9b9b9b)](https://gitee.com/q7104475/K8s)
 
 
 
